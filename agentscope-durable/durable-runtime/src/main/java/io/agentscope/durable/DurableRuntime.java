@@ -411,17 +411,23 @@ public final class DurableRuntime implements AutoCloseable {
                         var view =
                                 DurableJson.convert(
                                         session.call("getTurn", "turnId", turnId), TurnView.class);
-                        if (view.status().terminal()) result.complete(view);
-                        else if (System.nanoTime() - deadline >= 0)
-                            result.completeExceptionally(
-                                    new TimeoutException(
-                                            "Timed out observing Turn "
-                                                    + session.key()
-                                                    + "/"
-                                                    + turnId));
+                        if (view.status().terminal()) {
+                            result.complete(view);
+                            return;
+                        }
                     } catch (RuntimeException error) {
-                        result.completeExceptionally(error);
+                        if (!transientFailure(error)) {
+                            result.completeExceptionally(error);
+                            return;
+                        }
                     }
+                    if (System.nanoTime() - deadline >= 0)
+                        result.completeExceptionally(
+                                new TimeoutException(
+                                        "Timed out observing Turn "
+                                                + session.key()
+                                                + "/"
+                                                + turnId));
                 };
         AutoCloseable notification = observeWait(session.key().session(), result, enqueued, check);
         result.whenComplete(
