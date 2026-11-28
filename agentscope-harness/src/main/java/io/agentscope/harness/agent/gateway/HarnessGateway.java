@@ -355,6 +355,7 @@ public final class HarnessGateway implements Gateway, WakeupDispatcher.WakeupTar
             String subagentId,
             String agentId,
             String sessionId,
+            String userId,
             Agent agent,
             OutboundAddress replyTo) {}
 
@@ -383,7 +384,8 @@ public final class HarnessGateway implements Gateway, WakeupDispatcher.WakeupTar
         Objects.requireNonNull(agent, "agent");
         String subagentId = "sub-" + UUID.randomUUID().toString().substring(0, 8);
         exposedSessions.put(
-                subagentId, new ExposedSession(subagentId, agentId, sessionId, agent, replyTo));
+                subagentId,
+                new ExposedSession(subagentId, agentId, sessionId, userId, agent, replyTo));
         try {
             subagentRegistry.register(
                     new SubagentRecord(
@@ -510,6 +512,7 @@ public final class HarnessGateway implements Gateway, WakeupDispatcher.WakeupTar
                         record.subagentId(),
                         record.agentId(),
                         record.sessionId(),
+                        record.userId(),
                         agentOpt.get(),
                         null);
         exposedSessions.putIfAbsent(subagentId, rebuilt);
@@ -523,7 +526,7 @@ public final class HarnessGateway implements Gateway, WakeupDispatcher.WakeupTar
             return Mono.error(new IllegalArgumentException("Unknown subagentId: " + subagentId));
         }
 
-        RuntimeContext rtc = RuntimeContext.builder().sessionId(session.sessionId()).build();
+        RuntimeContext rtc = exposedRuntimeContext(session);
         String gateKey = "subagent:" + subagentId;
 
         return withGatedTurn(gateKey, () -> invokeExposedAgent(session.agent(), messages, rtc))
@@ -545,6 +548,21 @@ public final class HarnessGateway implements Gateway, WakeupDispatcher.WakeupTar
             return ra.call(messages, ctx);
         }
         return agent.call(messages);
+    }
+
+    /**
+     * Builds the {@link RuntimeContext} for a turn addressed to an exposed subagent. Carries the
+     * subagent's session id together with the owning user id captured at exposure time, so the
+     * turn loads and stores state from the same {@code (userId, sessionId)} slot as the original
+     * run — mirroring the {@link #runWakeup(String, String)} contract. A blank user id preserves
+     * the legacy anonymous behavior.
+     */
+    private static RuntimeContext exposedRuntimeContext(ExposedSession session) {
+        RuntimeContext.Builder rtcBuilder = RuntimeContext.builder().sessionId(session.sessionId());
+        if (session.userId() != null && !session.userId().isBlank()) {
+            rtcBuilder.userId(session.userId());
+        }
+        return rtcBuilder.build();
     }
 
     // -----------------------------------------------------------------
@@ -578,7 +596,7 @@ public final class HarnessGateway implements Gateway, WakeupDispatcher.WakeupTar
             return Flux.error(new IllegalArgumentException("Unknown subagentId: " + subagentId));
         }
 
-        RuntimeContext rtc = RuntimeContext.builder().sessionId(session.sessionId()).build();
+        RuntimeContext rtc = exposedRuntimeContext(session);
         String gateKey = "subagent:" + subagentId;
 
         return withGatedStream(gateKey, () -> streamExposedAgent(session.agent(), messages, rtc));

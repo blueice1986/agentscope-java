@@ -16,6 +16,7 @@
 package io.agentscope.harness.agent.gateway;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -29,17 +30,28 @@ import io.agentscope.core.agent.RuntimeContext;
 import io.agentscope.core.agent.test.MockModel;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.MsgRole;
+import io.agentscope.core.state.InMemoryAgentStateStore;
+import io.agentscope.harness.agent.DistributedStore;
 import io.agentscope.harness.agent.HarnessAgent;
+import io.agentscope.harness.agent.filesystem.remote.store.InMemoryStore;
 import io.agentscope.harness.agent.gateway.channel.ChannelRuntimeContextRequest;
 import io.agentscope.harness.agent.gateway.channel.InboundMessage;
 import io.agentscope.harness.agent.gateway.channel.OutboundAddress;
 import io.agentscope.harness.agent.gateway.channel.chatui.ChatUiChannel;
 import io.agentscope.harness.agent.gateway.channel.chatui.SendOptions;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 /** Verifies Gateway merge of caller {@link RuntimeContext} for Channel turns. */
@@ -201,6 +213,172 @@ class HarnessGatewayRuntimeContextMergeTest {
                         .withRuntimeContext(RuntimeContext.builder().put("b", 2).build());
         assertNull(options.runtimeContext().get("a"));
         assertEquals(2, options.runtimeContext().get("b", Integer.class));
+    }
+
+    // ------------------------------------------------------------------
+    //  Exposed-subagent identity propagation (runSubagent / runSubagentStream)
+    // ------------------------------------------------------------------
+
+    @TempDir Path workspace;
+
+    private static final Duration TIMEOUT = Duration.ofSeconds(30);
+
+    private final List<HarnessAgent> agents = new ArrayList<>();
+
+    @AfterEach
+    void closeCreatedAgents() {
+        agents.forEach(HarnessAgent::close);
+    }
+
+    @Test
+    @DisplayName("runSubagent carries the exposure userId into the subagent RuntimeContext")
+    void runSubagentCarriesExposedUserIdIntoRuntimeContext() {
+        AtomicReference<RuntimeContext> seen = new AtomicReference<>();
+        HarnessAgent subagent = spySubagent(seen);
+
+        HarnessGateway gateway = HarnessGateway.create();
+        String subagentId = gateway.exposeSubagent("coder", "s1", subagent, null, "alice");
+
+        Msg reply = gateway.runSubagent(subagentId, List.of(userMsg("hi"))).block();
+
+        assertNotNull(reply);
+        RuntimeContext ctx = seen.get();
+        assertNotNull(ctx);
+        assertEquals("alice", ctx.getUserId(), "follow-up turn must run as the owning user");
+        assertEquals("s1", ctx.getSessionId());
+    }
+
+    @Test
+    @DisplayName("runSubagentStream carries the exposure userId into the subagent RuntimeContext")
+    void runSubagentStreamCarriesExposedUserIdIntoRuntimeContext() {
+        AtomicReference<RuntimeContext> seen = new AtomicReference<>();
+        HarnessAgent subagent = spySubagent(seen);
+
+        HarnessGateway gateway = HarnessGateway.create();
+        String subagentId = gateway.exposeSubagent("coder", "s1", subagent, null, "alice");
+
+        gateway.runSubagentStream(subagentId, List.of(userMsg("hi"))).blockLast();
+
+        RuntimeContext ctx = seen.get();
+        assertNotNull(ctx);
+        assertEquals("alice", ctx.getUserId(), "follow-up turn must run as the owning user");
+        assertEquals("s1", ctx.getSessionId());
+    }
+
+    @Test
+    @DisplayName("cold-materialized subagent carries the registry userId into its turns")
+    void materializedSubagentCarriesRegistryUserIdIntoRuntimeContext() {
+        AtomicReference<RuntimeContext> seen = new AtomicReference<>();
+        HarnessAgent subagent = spySubagent(seen);
+
+        HarnessGateway gateway = HarnessGateway.create();
+        InMemorySubagentRegistry registry = new InMemorySubagentRegistry();
+        gateway.setSubagentRegistry(registry);
+        AtomicReference<RuntimeContext> materializedWith = new AtomicReference<>();
+        gateway.setSubagentMaterializer(
+                (agentId, parentRc) -> {
+                    materializedWith.set(parentRc);
+                    return Optional.of(subagent);
+                });
+        registry.register(
+                new SubagentRecord(
+                        "sub-cold", "coder", "s1", "alice", "parent-s1", Instant.now(), null));
+
+        Msg reply = gateway.runSubagent("sub-cold", List.of(userMsg("hi"))).block();
+
+        assertNotNull(reply);
+        assertEquals(
+                "alice",
+                materializedWith.get().getUserId(),
+                "materialization context already carries the registry identity");
+        RuntimeContext ctx = seen.get();
+        assertNotNull(ctx);
+        assertEquals("alice", ctx.getUserId(), "the rebuilt session must keep that identity");
+        assertEquals("s1", ctx.getSessionId());
+    }
+
+    @Test
+    @DisplayName("anonymous exposure keeps the legacy anonymous RuntimeContext")
+    void anonymousExposedSubagentKeepsAnonymousRuntimeContext() {
+        AtomicReference<RuntimeContext> seen = new AtomicReference<>();
+        HarnessAgent subagent = spySubagent(seen);
+
+        HarnessGateway gateway = HarnessGateway.create();
+        String subagentId = gateway.exposeSubagent("coder", "s1", subagent, null, null);
+
+        gateway.runSubagent(subagentId, List.of(userMsg("hi"))).block();
+
+        RuntimeContext ctx = seen.get();
+        assertNotNull(ctx);
+        assertNull(ctx.getUserId());
+        assertEquals("s1", ctx.getSessionId());
+    }
+
+    @Test
+    @DisplayName("a real follow-up turn persists state under (alice, s1), never an anonymous slot")
+    void runSubagentPersistsTurnStateInOwningUserSlot() {
+        InMemoryAgentStateStore stateStore = new InMemoryAgentStateStore();
+        DistributedStore distributedStore =
+                DistributedStore.builder()
+                        .baseStore(new InMemoryStore())
+                        .agentStateStore(stateStore)
+                        .build();
+        HarnessAgent subagent =
+                HarnessAgent.builder()
+                        .name("coder")
+                        .sysPrompt("be brief")
+                        .model(new MockModel("done"))
+                        .workspace(workspace.resolve("coder"))
+                        .distributedStore(distributedStore)
+                        .build();
+        agents.add(subagent);
+
+        HarnessGateway gateway = HarnessGateway.create();
+        String subagentId = gateway.exposeSubagent("coder", "s1", subagent, null, "alice");
+
+        Msg reply = gateway.runSubagent(subagentId, List.of(userMsg("hi"))).block(TIMEOUT);
+
+        assertNotNull(reply);
+        boolean aliceSlot = stateStore.exists("alice", "s1");
+        boolean anonymousSlot = stateStore.exists(null, "s1");
+        assertTrue(
+                aliceSlot,
+                "turn state must be keyed to the owning user's (alice, s1) slot; anonymous slot"
+                        + " present="
+                        + anonymousSlot);
+        assertFalse(
+                anonymousSlot, "no orphan anonymous slot may be created for a user-owned subagent");
+    }
+
+    /** Builds a HarnessAgent spy that records the {@link RuntimeContext} of each real turn. */
+    private HarnessAgent spySubagent(AtomicReference<RuntimeContext> seen) {
+        HarnessAgent agent =
+                spy(
+                        HarnessAgent.builder()
+                                .name("coder")
+                                .sysPrompt("hi")
+                                .model(new MockModel("ok"))
+                                .build());
+        agents.add(agent);
+        doAnswer(
+                        inv -> {
+                            seen.set(inv.getArgument(1));
+                            return Mono.just(
+                                    Msg.builder()
+                                            .role(MsgRole.ASSISTANT)
+                                            .textContent("ok")
+                                            .build());
+                        })
+                .when(agent)
+                .call(anyList(), any(RuntimeContext.class));
+        doAnswer(
+                        inv -> {
+                            seen.set(inv.getArgument(1));
+                            return Flux.empty();
+                        })
+                .when(agent)
+                .streamEvents(anyList(), any(RuntimeContext.class));
+        return agent;
     }
 
     private static Msg userMsg(String text) {
